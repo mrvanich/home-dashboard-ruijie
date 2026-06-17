@@ -1,0 +1,9 @@
+[
+  {
+    "name": "My PC",
+    "mac": "AA:BB:CC:DD:EE:FF",
+    "ip": "192.168.24.27",
+    "netbios": "",
+    "notes": ""
+  }
+]

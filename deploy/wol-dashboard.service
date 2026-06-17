@@ -1,0 +1,16 @@
+[Unit]
+Description=Home Dashboard (Flask + Ruijie WAN)
+After=network.target
+
+[Service]
+Type=simple
+User=vani4
+WorkingDirectory=/home/vani4/wol
+ExecStart=/home/vani4/wol/venv/bin/python app.py
+Restart=always
+RestartSec=4
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

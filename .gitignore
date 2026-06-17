@@ -1,0 +1,20 @@
+# Secrets — never commit real credentials
+data/ruijie.json
+data/machines.json
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Debug / local
+*.log
+/tmp/
