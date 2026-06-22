@@ -34,6 +34,10 @@
         </header>
 
         <!-- Pi Stats -->
+        <div class="flex items-center gap-2 mb-3">
+            <i class="fa-solid fa-microchip text-emerald-400"></i>
+            <h2 class="text-sm font-semibold text-zinc-300">Raspberry Pi · 192.168.24.8</h2>
+        </div>
         <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-6">
             <div class="glass rounded-2xl p-4 glow-orange col-span-2 md:col-span-1">
                 <div class="text-xs text-zinc-500 uppercase tracking-wider mb-1">CPU Temp</div>
@@ -66,6 +70,42 @@
                 <div class="text-xs text-zinc-500 mt-1" id="total-count">—</div>
             </div>
         </div>
+
+        <!-- Windows PC (Zabbix) -->
+        <div class="flex items-center gap-2 mb-3 mt-2">
+            <i class="fa-brands fa-windows text-sky-400"></i>
+            <h2 class="text-sm font-semibold text-zinc-300">Windows PC · <span id="pc-ip-label">192.168.24.27</span></h2>
+            <span id="pc-zabbix-status" class="text-xs text-zinc-600">Zabbix</span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4 mb-6">
+            <div class="glass rounded-2xl p-4 glow-orange col-span-2 md:col-span-1">
+                <div class="text-xs text-zinc-500 uppercase tracking-wider mb-1">CPU Temp</div>
+                <div class="text-3xl font-bold" id="pc-cpu-temp">—</div>
+                <div class="temp-bar mt-2"><div id="pc-temp-bar" class="h-full rounded bg-transparent" style="width:0%; height:6px"></div></div>
+                <div class="text-xs text-zinc-600 mt-1" id="pc-temp-hint"></div>
+            </div>
+            <div class="glass rounded-2xl p-4">
+                <div class="text-xs text-zinc-500 uppercase tracking-wider mb-1">CPU Load</div>
+                <div class="text-2xl font-bold" id="pc-cpu-load">—</div>
+                <div class="text-xs text-zinc-500 mt-1" id="pc-cpu-load-detail">Zabbix system.cpu.util</div>
+            </div>
+            <div class="glass rounded-2xl p-4">
+                <div class="text-xs text-zinc-500 uppercase tracking-wider mb-1">Uptime</div>
+                <div class="text-lg font-bold" id="pc-uptime">—</div>
+                <div class="text-xs text-zinc-500 mt-1" id="pc-hostname">pc-win27</div>
+            </div>
+            <div class="glass rounded-2xl p-4 col-span-2 md:col-span-1" id="pc-online-card">
+                <div class="text-xs text-zinc-500 uppercase tracking-wider mb-1">Status</div>
+                <div class="text-2xl font-bold" id="pc-online">—</div>
+                <div class="text-xs text-zinc-500 mt-1" id="pc-online-detail">—</div>
+            </div>
+            <div class="glass rounded-2xl p-4 col-span-2 md:col-span-2">
+                <div class="text-xs text-zinc-500 uppercase tracking-wider mb-1">Zabbix Agent</div>
+                <div class="text-lg font-bold" id="pc-agent">—</div>
+                <div class="text-xs text-zinc-500 mt-1" id="pc-agent-detail">—</div>
+            </div>
+        </div>
+        <div id="pc-error" class="hidden mb-6 text-xs text-amber-400/90 bg-amber-950/30 border border-amber-900/40 rounded-lg px-3 py-2"></div>
 
         <!-- Ruijie WAN -->
         <div class="glass rounded-2xl p-5 mb-6 border border-zinc-800/80">
@@ -342,8 +382,74 @@
             }
         }
 
+        async function loadPc() {
+            const errEl = document.getElementById('pc-error');
+            try {
+                const r = await fetch('/wol/api/pc');
+                const p = await r.json();
+                if (p.ip) document.getElementById('pc-ip-label').textContent = p.ip;
+                if (p.name) document.getElementById('pc-hostname').textContent = p.host || 'pc-win27';
+                const tempEl = document.getElementById('pc-cpu-temp');
+                const tempHint = document.getElementById('pc-temp-hint');
+                if (p.cpu_temp_c != null) {
+                    tempEl.textContent = p.cpu_temp_c + '°C';
+                    tempEl.className = 'text-3xl font-bold ' + (p.cpu_temp_c > 80 ? 'text-red-400' : p.cpu_temp_c > 65 ? 'text-yellow-400' : 'text-emerald-400');
+                    const pct = Math.min(100, Math.max(0, (p.cpu_temp_c - 30) / 55 * 100));
+                    document.getElementById('pc-temp-bar').style.width = pct + '%';
+                    document.getElementById('pc-temp-bar').style.background = 'linear-gradient(90deg, #22c55e, #eab308, #ef4444)';
+                    tempHint.textContent = p.cpu_temp_key || '';
+                } else {
+                    tempEl.textContent = '—';
+                    tempEl.className = 'text-3xl font-bold text-zinc-500';
+                    document.getElementById('pc-temp-bar').style.width = '0%';
+                    tempHint.textContent = 'немає temp item у Zabbix';
+                }
+                if (p.cpu_load_pct != null) {
+                    document.getElementById('pc-cpu-load').textContent = p.cpu_load_pct + '%';
+                    document.getElementById('pc-cpu-load').className = 'text-2xl font-bold ' + (p.cpu_load_pct > 85 ? 'text-red-400' : p.cpu_load_pct > 60 ? 'text-yellow-400' : 'text-sky-300');
+                } else {
+                    document.getElementById('pc-cpu-load').textContent = '—';
+                }
+                document.getElementById('pc-uptime').textContent = p.uptime || '—';
+                const onlineEl = document.getElementById('pc-online');
+                const onlineCard = document.getElementById('pc-online-card');
+                if (p.online === true) {
+                    onlineEl.innerHTML = '<span class="inline-flex items-center gap-2 text-emerald-400"><span class="dot-online"></span>Online</span>';
+                    onlineCard.classList.add('glow-green');
+                    document.getElementById('pc-online-detail').textContent = 'Agent / ping OK';
+                } else if (p.online === false) {
+                    onlineEl.innerHTML = '<span class="inline-flex items-center gap-2 text-zinc-500"><span class="dot-offline"></span>Offline</span>';
+                    onlineCard.classList.remove('glow-green');
+                    document.getElementById('pc-online-detail').textContent = 'Немає зв\'язку з агентом';
+                } else {
+                    onlineEl.textContent = '—';
+                    onlineCard.classList.remove('glow-green');
+                }
+                const agentEl = document.getElementById('pc-agent');
+                if (p.agent_available === true) {
+                    agentEl.innerHTML = '<span class="text-emerald-400"><i class="fa-solid fa-circle-check mr-1"></i>Available</span>';
+                } else if (p.agent_available === false) {
+                    agentEl.innerHTML = '<span class="text-red-400"><i class="fa-solid fa-circle-xmark mr-1"></i>Unavailable</span>';
+                } else {
+                    agentEl.textContent = '—';
+                }
+                const st = p.cached ? `cached ${p.cache_age_sec || 0}s ago` : 'live';
+                document.getElementById('pc-zabbix-status').textContent = p.ok ? ('Zabbix · ' + st) : 'Zabbix · error';
+                document.getElementById('pc-agent-detail').textContent = p.timestamp ? new Date(p.timestamp).toLocaleTimeString('uk-UA') : '—';
+                if (p.ok) errEl.classList.add('hidden');
+                else {
+                    errEl.textContent = p.error || 'PC stats unavailable';
+                    errEl.classList.remove('hidden');
+                }
+            } catch (e) {
+                errEl.textContent = 'PC fetch failed: ' + e;
+                errEl.classList.remove('hidden');
+            }
+        }
+
         async function refreshAll(manual) {
             await loadSystem();
+            await loadPc();
             await loadWan(!!manual);
             await scanNetwork();
             document.getElementById('last-update').textContent = new Date().toLocaleTimeString('uk-UA');

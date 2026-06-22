@@ -1,0 +1,8 @@
+{
+  "api_url": "http://127.0.0.1:8080/api_jsonrpc.php",
+  "username": "Admin",
+  "password": "zabbix",
+  "pc_host": "pc-win27",
+  "pc_ip": "192.168.24.27",
+  "pc_name": "Windows 11 PC"
+}

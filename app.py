@@ -8,6 +8,8 @@ import re
 import socket
 import glob
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template, request, jsonify
@@ -17,8 +19,12 @@ app = Flask(__name__)
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DATA_FILE = os.path.join(DATA_DIR, "machines.json")
 RUIJIE_WAN_SCRIPT = os.path.join(os.path.dirname(__file__), "scripts", "ruijie_wan.js")
+ZABBIX_CONFIG = os.path.join(DATA_DIR, "zabbix.json")
 WAN_CACHE_TTL = 600  # 10 minutes
+PC_CACHE_TTL = 60
 _wan_cache = {"ts": 0, "data": None}
+_pc_cache = {"ts": 0, "data": None}
+_zabbix_token = {"token": None, "ts": 0}
 os.makedirs(DATA_DIR, exist_ok=True)
 
 MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$")
@@ -424,9 +430,203 @@ def api_scan():
         return jsonify({"error": str(e), "devices": []}), 500
 
 
+def read_zabbix_config():
+    defaults = {
+        "api_url": "http://127.0.0.1:8080/api_jsonrpc.php",
+        "username": "Admin",
+        "password": "zabbix",
+        "pc_host": "pc-win27",
+        "pc_ip": "192.168.24.27",
+        "pc_name": "Windows 11 PC",
+    }
+    try:
+        with open(ZABBIX_CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+            return {**defaults, **cfg}
+    except Exception:
+        return defaults
+
+
+def zabbix_rpc(method, params, token=None):
+    body = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(
+        read_zabbix_config()["api_url"],
+        data=json.dumps(body).encode(),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        data = json.loads(resp.read())
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", str(data["error"])))
+    return data["result"]
+
+
+def zabbix_token():
+    global _zabbix_token
+    now = time.time()
+    if _zabbix_token["token"] and (now - _zabbix_token["ts"]) < 300:
+        return _zabbix_token["token"]
+    cfg = read_zabbix_config()
+    token = zabbix_rpc("user.login", {"username": cfg["username"], "password": cfg["password"]})
+    _zabbix_token = {"token": token, "ts": now}
+    return token
+
+
+def format_uptime_seconds(raw):
+    try:
+        sec = int(float(raw))
+    except (TypeError, ValueError):
+        return None
+    days, rem = divmod(sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{mins}m")
+    return " ".join(parts)
+
+
+def pick_cpu_temp_item(items):
+    """Pick best CPU temperature item from Zabbix host items, if any."""
+    candidates = []
+    for item in items:
+        key = (item.get("key_") or "").lower()
+        name = (item.get("name") or "").lower()
+        if not any(x in key or x in name for x in ("temp", "thermal")):
+            continue
+        if item.get("state") == "1" or item.get("status") == "1":
+            continue
+        val = item.get("lastvalue")
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            continue
+        score = 0
+        if "cpu" in key or "cpu" in name or "processor" in name:
+            score += 3
+        if "package" in key or "package" in name:
+            score += 2
+        if "thermal" in key or "thermal" in name:
+            score += 1
+        candidates.append((score, num, item.get("key_")))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    _, raw, key = candidates[0]
+    temp = raw
+    if temp > 200:
+        temp = (temp / 10.0) - 273.15
+    return {"celsius": round(temp, 1), "key": key}
+
+
+def fetch_pc_stats(force: bool = False) -> dict:
+    global _pc_cache
+    now = time.time()
+    if not force and _pc_cache["data"] and (now - _pc_cache["ts"]) < PC_CACHE_TTL:
+        out = dict(_pc_cache["data"])
+        out["cached"] = True
+        out["cache_age_sec"] = int(now - _pc_cache["ts"])
+        return out
+
+    cfg = read_zabbix_config()
+    result = {
+        "ok": False,
+        "host": cfg["pc_host"],
+        "name": cfg["pc_name"],
+        "ip": cfg["pc_ip"],
+        "online": None,
+        "cpu_load_pct": None,
+        "cpu_temp_c": None,
+        "cpu_temp_key": None,
+        "uptime": None,
+        "uptime_sec": None,
+        "agent_available": None,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "cached": False,
+    }
+    try:
+        token = zabbix_token()
+        hosts = zabbix_rpc(
+            "host.get",
+            {
+                "output": ["hostid", "host", "name"],
+                "filter": {"host": cfg["pc_host"]},
+                "selectInterfaces": ["ip", "available"],
+            },
+            token,
+        )
+        if not hosts:
+            raise RuntimeError(f"Zabbix host {cfg['pc_host']!r} not found")
+        host = hosts[0]
+        result["name"] = host.get("name") or cfg["pc_name"]
+        if host.get("interfaces"):
+            result["ip"] = host["interfaces"][0].get("ip") or cfg["pc_ip"]
+
+        keys = [
+            "system.cpu.util",
+            "agent.ping",
+            "zabbix[host,active_agent,available]",
+            "system.uptime",
+            "icmpping",
+        ]
+        items = zabbix_rpc(
+            "item.get",
+            {
+                "output": ["key_", "name", "lastvalue", "lastclock", "state", "status"],
+                "hostids": host["hostid"],
+                "filter": {"key_": keys},
+            },
+            token,
+        )
+        all_items = zabbix_rpc(
+            "item.get",
+            {
+                "output": ["key_", "name", "lastvalue", "state", "status"],
+                "hostids": host["hostid"],
+                "sortfield": "key_",
+            },
+            token,
+        )
+        by_key = {i["key_"]: i for i in items}
+        if "system.cpu.util" in by_key:
+            result["cpu_load_pct"] = round(float(by_key["system.cpu.util"]["lastvalue"]), 1)
+        if "system.uptime" in by_key:
+            result["uptime_sec"] = int(float(by_key["system.uptime"]["lastvalue"]))
+            result["uptime"] = format_uptime_seconds(result["uptime_sec"])
+        agent_ok = by_key.get("zabbix[host,active_agent,available]", {}).get("lastvalue") == "1"
+        ping_ok = by_key.get("agent.ping", {}).get("lastvalue") == "1"
+        icmp_ok = by_key.get("icmpping", {}).get("lastvalue") == "1"
+        result["agent_available"] = agent_ok or ping_ok
+        result["online"] = agent_ok or ping_ok or icmp_ok
+        temp = pick_cpu_temp_item(all_items)
+        if temp:
+            result["cpu_temp_c"] = temp["celsius"]
+            result["cpu_temp_key"] = temp["key"]
+        result["ok"] = True
+        _pc_cache = {"ts": now, "data": result}
+    except (urllib.error.URLError, RuntimeError, ValueError, KeyError) as exc:
+        result["error"] = str(exc)
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
 @app.route("/api/system")
 def api_system():
     return jsonify(read_system_stats())
+
+
+@app.route("/api/pc")
+def api_pc():
+    force = request.args.get("refresh") == "1"
+    return jsonify(fetch_pc_stats(force=force))
 
 
 def fetch_wan_stats(force: bool = False) -> dict:

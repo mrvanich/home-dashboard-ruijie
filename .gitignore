@@ -1,6 +1,7 @@
 # Secrets — never commit real credentials
 data/ruijie.json
 data/machines.json
+data/zabbix.json
 
 # Python
 venv/
