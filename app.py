@@ -24,6 +24,7 @@ WAN_CACHE_TTL = 600  # 10 minutes
 PC_CACHE_TTL = 60
 _wan_cache = {"ts": 0, "data": None}
 _pc_cache = {"ts": 0, "data": None}
+_pcs_cache = {"ts": 0, "data": None}
 _zabbix_token = {"token": None, "ts": 0}
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -438,6 +439,10 @@ def read_zabbix_config():
         "pc_host": "pc-win27",
         "pc_ip": "192.168.24.27",
         "pc_name": "Windows 11 PC",
+        "pcs": [
+            {"host": "SERVASUS", "ip": "192.168.24.200", "name": "SERVASUS"},
+            {"host": "pc-win27", "ip": "192.168.24.27", "name": "Windows 11 PC"},
+        ],
     }
     try:
         with open(ZABBIX_CONFIG, encoding="utf-8") as f:
@@ -499,7 +504,9 @@ def pick_cpu_temp_item(items):
     for item in items:
         key = (item.get("key_") or "").lower()
         name = (item.get("name") or "").lower()
-        if not any(x in key or x in name for x in ("temp", "thermal")):
+        is_lhm = key.startswith("lhm.sensor[")
+        is_temp = any(x in key or x in name for x in ("temp", "thermal"))
+        if not is_temp and not is_lhm:
             continue
         if item.get("state") == "1" or item.get("status") == "1":
             continue
@@ -508,13 +515,23 @@ def pick_cpu_temp_item(items):
             num = float(val)
         except (TypeError, ValueError):
             continue
+        if num <= 0 or num > 120:
+            continue
         score = 0
+        if is_lhm:
+            score += 4
         if "cpu" in key or "cpu" in name or "processor" in name:
             score += 3
         if "package" in key or "package" in name:
             score += 2
+        if "core" in key or "core" in name:
+            score += 1
         if "thermal" in key or "thermal" in name:
             score += 1
+        if "gpu" in key or "gpu" in name or "graphics" in name:
+            score -= 3
+        if "hdd" in key or "hdd" in name or "nvme" in name or "ssd" in name:
+            score -= 3
         candidates.append((score, num, item.get("key_")))
     if not candidates:
         return None
@@ -526,21 +543,16 @@ def pick_cpu_temp_item(items):
     return {"celsius": round(temp, 1), "key": key}
 
 
-def fetch_pc_stats(force: bool = False) -> dict:
-    global _pc_cache
-    now = time.time()
-    if not force and _pc_cache["data"] and (now - _pc_cache["ts"]) < PC_CACHE_TTL:
-        out = dict(_pc_cache["data"])
-        out["cached"] = True
-        out["cache_age_sec"] = int(now - _pc_cache["ts"])
-        return out
-
+def fetch_one_pc_stats(pc_cfg: dict) -> dict:
     cfg = read_zabbix_config()
+    host_name = pc_cfg.get("host") or cfg["pc_host"]
+    fallback_ip = pc_cfg.get("ip") or cfg["pc_ip"]
+    fallback_name = pc_cfg.get("name") or cfg["pc_name"]
     result = {
         "ok": False,
-        "host": cfg["pc_host"],
-        "name": cfg["pc_name"],
-        "ip": cfg["pc_ip"],
+        "host": host_name,
+        "name": fallback_name,
+        "ip": fallback_ip,
         "online": None,
         "cpu_load_pct": None,
         "cpu_temp_c": None,
@@ -557,17 +569,18 @@ def fetch_pc_stats(force: bool = False) -> dict:
             "host.get",
             {
                 "output": ["hostid", "host", "name"],
-                "filter": {"host": cfg["pc_host"]},
+                "filter": {"host": host_name},
                 "selectInterfaces": ["ip", "available"],
             },
             token,
         )
         if not hosts:
-            raise RuntimeError(f"Zabbix host {cfg['pc_host']!r} not found")
+            raise RuntimeError(f"Zabbix host {host_name!r} not found")
         host = hosts[0]
-        result["name"] = host.get("name") or cfg["pc_name"]
+        result["name"] = host.get("name") or fallback_name
+        result["host"] = host.get("host") or host_name
         if host.get("interfaces"):
-            result["ip"] = host["interfaces"][0].get("ip") or cfg["pc_ip"]
+            result["ip"] = host["interfaces"][0].get("ip") or fallback_ip
 
         keys = [
             "system.cpu.util",
@@ -575,6 +588,7 @@ def fetch_pc_stats(force: bool = False) -> dict:
             "zabbix[host,active_agent,available]",
             "system.uptime",
             "icmpping",
+            f"icmpping[{result['ip']}]",
         ]
         items = zabbix_rpc(
             "item.get",
@@ -602,7 +616,7 @@ def fetch_pc_stats(force: bool = False) -> dict:
             result["uptime"] = format_uptime_seconds(result["uptime_sec"])
         agent_ok = by_key.get("zabbix[host,active_agent,available]", {}).get("lastvalue") == "1"
         ping_ok = by_key.get("agent.ping", {}).get("lastvalue") == "1"
-        icmp_ok = by_key.get("icmpping", {}).get("lastvalue") == "1"
+        icmp_ok = any(item.get("key_", "").startswith("icmpping") and item.get("lastvalue") == "1" for item in items)
         result["agent_available"] = agent_ok or ping_ok
         result["online"] = agent_ok or ping_ok or icmp_ok
         temp = pick_cpu_temp_item(all_items)
@@ -610,11 +624,50 @@ def fetch_pc_stats(force: bool = False) -> dict:
             result["cpu_temp_c"] = temp["celsius"]
             result["cpu_temp_key"] = temp["key"]
         result["ok"] = True
-        _pc_cache = {"ts": now, "data": result}
     except (urllib.error.URLError, RuntimeError, ValueError, KeyError) as exc:
         result["error"] = str(exc)
     except Exception as exc:
         result["error"] = str(exc)
+    return result
+
+
+def fetch_pc_stats(force: bool = False) -> dict:
+    global _pc_cache
+    now = time.time()
+    if not force and _pc_cache["data"] and (now - _pc_cache["ts"]) < PC_CACHE_TTL:
+        out = dict(_pc_cache["data"])
+        out["cached"] = True
+        out["cache_age_sec"] = int(now - _pc_cache["ts"])
+        return out
+
+    cfg = read_zabbix_config()
+    result = fetch_one_pc_stats({"host": cfg["pc_host"], "ip": cfg["pc_ip"], "name": cfg["pc_name"]})
+    _pc_cache = {"ts": now, "data": result}
+    return result
+
+
+def fetch_pcs_stats(force: bool = False) -> dict:
+    global _pcs_cache
+    now = time.time()
+    if not force and _pcs_cache["data"] and (now - _pcs_cache["ts"]) < PC_CACHE_TTL:
+        out = dict(_pcs_cache["data"])
+        out["cached"] = True
+        out["cache_age_sec"] = int(now - _pcs_cache["ts"])
+        return out
+    cfg = read_zabbix_config()
+    pcs = cfg.get("pcs") or [{"host": cfg["pc_host"], "ip": cfg["pc_ip"], "name": cfg["pc_name"]}]
+    result = {
+        "ok": True,
+        "pcs": [],
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "cached": False,
+    }
+    for pc_cfg in pcs:
+        pc = fetch_one_pc_stats(pc_cfg)
+        result["pcs"].append(pc)
+        if not pc.get("ok"):
+            result["ok"] = False
+    _pcs_cache = {"ts": now, "data": result}
     return result
 
 
@@ -627,6 +680,12 @@ def api_system():
 def api_pc():
     force = request.args.get("refresh") == "1"
     return jsonify(fetch_pc_stats(force=force))
+
+
+@app.route("/api/pcs")
+def api_pcs():
+    force = request.args.get("refresh") == "1"
+    return jsonify(fetch_pcs_stats(force=force))
 
 
 def fetch_wan_stats(force: bool = False) -> dict:

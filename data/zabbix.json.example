@@ -4,5 +4,17 @@
   "password": "zabbix",
   "pc_host": "pc-win27",
   "pc_ip": "192.168.24.27",
-  "pc_name": "Windows 11 PC"
+  "pc_name": "Windows 11 PC",
+  "pcs": [
+    {
+      "host": "SERVASUS",
+      "ip": "192.168.24.200",
+      "name": "SERVASUS"
+    },
+    {
+      "host": "pc-win27",
+      "ip": "192.168.24.27",
+      "name": "Windows 11 PC"
+    }
+  ]
 }
