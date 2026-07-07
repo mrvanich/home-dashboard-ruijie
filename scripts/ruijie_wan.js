@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /**
  * Fetch Ruijie/Reyee EG105GW WAN upload/download rates via eWeb devSta API.
- * Uses module "flow" / func "interface_info" (same as eWeb Real-Time Flow).
+ * Uses port_status + flow_status because those counters match the physical WAN port.
  */
 const https = require('https');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const CONFIG = path.join(__dirname, '../data/ruijie.json');
 const GibberishAES = require(path.join(__dirname, 'gibberish-aes.js'));
@@ -24,13 +26,14 @@ function request(url, body, extraHeaders = {}, method) {
     const u = new URL(url);
     const data = body ? JSON.stringify(body) : null;
     const reqMethod = method || (data ? 'POST' : 'GET');
-    const req = https.request(
+    const client = u.protocol === 'http:' ? http : https;
+    const req = client.request(
       {
         hostname: u.hostname,
-        port: u.port || 443,
+        port: u.port || (u.protocol === 'http:' ? 80 : 443),
         path: u.pathname + u.search,
         method: reqMethod,
-        rejectUnauthorized: false,
+        rejectUnauthorized: u.protocol === 'http:' ? undefined : false,
         headers: {
           ...(data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {}),
           ...extraHeaders,
@@ -56,6 +59,10 @@ function request(url, body, extraHeaders = {}, method) {
     if (data) req.write(data);
     req.end();
   });
+}
+
+function md5(value) {
+  return crypto.createHash('md5').update(value).digest('hex');
 }
 
 async function fetchAesKey(host) {
@@ -92,41 +99,56 @@ async function login(cfg) {
   const cookie = ((res.headers && res.headers['set-cookie']) || [])
     .map((c) => c.split(';')[0])
     .join('; ');
-  return { host, sid: data.sid, cookie };
+  return { host, sid: data.sid, sn: data.sn, cookie };
 }
 
-async function cmdGet(session, module, data) {
-  const url = `https://${session.host}/cgi-bin/luci/api/cmd?auth=${session.sid}`;
-  const headers = session.cookie ? { Cookie: session.cookie } : {};
+async function cmdGet(session, module) {
+  const url = `http://${session.host}/cgi-bin/luci/api/cmd?auth=${session.sid}`;
   const params = { module, device: 'pc' };
-  if (data !== undefined) params.data = data;
-  const res = await request(url, { method: 'devSta.get', params }, headers);
+  const payload = { method: 'devSta.get', params };
+  const text = JSON.stringify(payload);
+  const headers = {
+    'Content-Accept': md5(`Web@Rj$2020!${Buffer.byteLength(text)}`),
+    'Contents-Accept': md5(`Web@Rj$2020!${text}`),
+  };
+  if (session.sn && session.sid) {
+    headers.Cookie = `${session.sn}=${session.sid}`;
+  } else if (session.cookie) {
+    headers.Cookie = session.cookie;
+  }
+  const res = await request(url, payload, headers);
   if (res.status === 403) throw new Error('API auth expired');
   return res.json;
 }
 
-/** eWeb returns WAN rates as bytes/s strings; dashboard expects bps. */
-function bytesPerSecToBps(value) {
+/** flow_status returns rates in kbps; dashboard stores/displays bytes per second. */
+function kbpsToBytesPerSec(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n < 0) return null;
-  return Math.round(n * 8);
+  return Math.round((n * 1000) / 8);
 }
 
 async function fetchWanRates(session) {
-  const res = await cmdGet(session, 'flow', { func: 'interface_info' });
-  if (!res || res.code !== 0) {
-    const msg = (res && res.error && res.error.message) || 'flow API error';
+  const [portsRes, flowRes] = await Promise.all([cmdGet(session, 'port_status'), cmdGet(session, 'flow_status')]);
+  if (!portsRes || portsRes.code !== 0 || !flowRes || flowRes.code !== 0) {
+    const msg =
+      (portsRes && portsRes.error && portsRes.error.message) ||
+      (flowRes && flowRes.error && flowRes.error.message) ||
+      'port flow API error';
     throw new Error(msg);
   }
-  const payload = res.data && res.data.data;
-  const wan = payload && payload.wan;
-  if (!wan || (wan.up == null && wan.down == null)) {
-    throw new Error('WAN rate data missing in flow response');
+  const wanPort = ((portsRes.data && portsRes.data.List) || []).find((p) => p.name === 'WAN' || p.panel_name === 'WAN');
+  if (!wanPort) {
+    throw new Error('WAN port not found in port_status');
+  }
+  const row = ((flowRes.data && flowRes.data.data) || []).find((p) => String(p.lpid) === String(wanPort.portId));
+  if (!row) {
+    throw new Error(`WAN lpid ${wanPort.portId} not found in flow_status`);
   }
   return {
-    upload_bps: bytesPerSecToBps(wan.up),
-    download_bps: bytesPerSecToBps(wan.down),
-    raw: wan,
+    upload_bps: kbpsToBytesPerSec(row.output_rate),
+    download_bps: kbpsToBytesPerSec(row.input_rate),
+    raw: { port: wanPort, flow: row },
   };
 }
 
@@ -162,7 +184,7 @@ async function main() {
         download_bps: rates.download_bps,
         upload_human: fmt(rates.upload_bps),
         download_human: fmt(rates.download_bps),
-        api_method: 'devSta.get flow interface_info',
+        api_method: 'devSta.get port_status + flow_status',
         timestamp: new Date().toISOString(),
       })
     );

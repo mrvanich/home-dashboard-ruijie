@@ -1,0 +1,12 @@
+/var/log/ruijie/*.log {
+    size 200M
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 0640 syslog adm
+    sharedscripts
+    postrotate
+        systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
+    endscript
+}
