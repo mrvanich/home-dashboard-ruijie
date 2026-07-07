@@ -154,9 +154,10 @@ async function fetchWanRates(session) {
 
 function fmt(bps) {
   if (bps == null) return '—';
-  if (bps >= 1048576) return (bps / 1048576).toFixed(2) + ' MB/s';
-  if (bps >= 1024) return (bps / 1024).toFixed(1) + ' KB/s';
-  return bps + ' B/s';
+  const mbps = (bps * 8) / 1000000;
+  if (mbps >= 100) return mbps.toFixed(0) + ' Mbps';
+  if (mbps >= 10) return mbps.toFixed(1) + ' Mbps';
+  return mbps.toFixed(2) + ' Mbps';
 }
 
 async function main() {

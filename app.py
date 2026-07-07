@@ -498,7 +498,19 @@ def format_uptime_seconds(raw):
     return " ".join(parts)
 
 
-def pick_cpu_temp_item(items):
+def item_is_fresh(item, max_age=300):
+    try:
+        lastclock = int(item.get("lastclock") or 0)
+    except (TypeError, ValueError):
+        return False
+    return lastclock > 0 and (time.time() - lastclock) <= max_age
+
+
+def item_value_is(item, value, max_age=300):
+    return bool(item) and item.get("lastvalue") == value and item_is_fresh(item, max_age)
+
+
+def pick_cpu_temp_item(items, max_age=900):
     """Pick best CPU temperature item from Zabbix host items, if any."""
     candidates = []
     for item in items:
@@ -509,6 +521,8 @@ def pick_cpu_temp_item(items):
         if not is_temp and not is_lhm:
             continue
         if item.get("state") == "1" or item.get("status") == "1":
+            continue
+        if not item_is_fresh(item, max_age):
             continue
         val = item.get("lastvalue")
         try:
@@ -602,21 +616,23 @@ def fetch_one_pc_stats(pc_cfg: dict) -> dict:
         all_items = zabbix_rpc(
             "item.get",
             {
-                "output": ["key_", "name", "lastvalue", "state", "status"],
+                "output": ["key_", "name", "lastvalue", "lastclock", "state", "status"],
                 "hostids": host["hostid"],
                 "sortfield": "key_",
             },
             token,
         )
         by_key = {i["key_"]: i for i in items}
-        if "system.cpu.util" in by_key:
+        if item_is_fresh(by_key.get("system.cpu.util"), 300):
             result["cpu_load_pct"] = round(float(by_key["system.cpu.util"]["lastvalue"]), 1)
-        if "system.uptime" in by_key:
+        if item_is_fresh(by_key.get("system.uptime"), 300):
             result["uptime_sec"] = int(float(by_key["system.uptime"]["lastvalue"]))
             result["uptime"] = format_uptime_seconds(result["uptime_sec"])
-        agent_ok = by_key.get("zabbix[host,active_agent,available]", {}).get("lastvalue") == "1"
-        ping_ok = by_key.get("agent.ping", {}).get("lastvalue") == "1"
-        icmp_ok = any(item.get("key_", "").startswith("icmpping") and item.get("lastvalue") == "1" for item in items)
+        agent_ok = item_value_is(by_key.get("zabbix[host,active_agent,available]"), "1", 300)
+        ping_ok = item_value_is(by_key.get("agent.ping"), "1", 300)
+        icmp_ok = any(
+            item.get("key_", "").startswith("icmpping") and item_value_is(item, "1", 300) for item in items
+        )
         result["agent_available"] = agent_ok or ping_ok
         result["online"] = agent_ok or ping_ok or icmp_ok
         temp = pick_cpu_temp_item(all_items)
@@ -695,11 +711,12 @@ def fmt_bps(bytes_per_sec):
         value = float(bytes_per_sec)
     except (TypeError, ValueError):
         return "—"
-    if value >= 1048576:
-        return f"{value / 1048576:.2f} MB/s"
-    if value >= 1024:
-        return f"{value / 1024:.1f} KB/s"
-    return f"{int(value)} B/s"
+    mbps = value * 8 / 1_000_000
+    if mbps >= 100:
+        return f"{mbps:.0f} Mbps"
+    if mbps >= 10:
+        return f"{mbps:.1f} Mbps"
+    return f"{mbps:.2f} Mbps"
 
 
 def fetch_wan_stats(force: bool = False) -> dict:
