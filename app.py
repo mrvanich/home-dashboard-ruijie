@@ -20,7 +20,7 @@ DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DATA_FILE = os.path.join(DATA_DIR, "machines.json")
 RUIJIE_WAN_SCRIPT = os.path.join(os.path.dirname(__file__), "scripts", "ruijie_wan.js")
 ZABBIX_CONFIG = os.path.join(DATA_DIR, "zabbix.json")
-WAN_CACHE_TTL = 600  # 10 minutes
+WAN_CACHE_TTL = 30
 PC_CACHE_TTL = 60
 _wan_cache = {"ts": 0, "data": None}
 _pc_cache = {"ts": 0, "data": None}
@@ -688,6 +688,20 @@ def api_pcs():
     return jsonify(fetch_pcs_stats(force=force))
 
 
+def fmt_bps(bytes_per_sec):
+    if bytes_per_sec is None:
+        return "—"
+    try:
+        value = float(bytes_per_sec)
+    except (TypeError, ValueError):
+        return "—"
+    if value >= 1048576:
+        return f"{value / 1048576:.2f} MB/s"
+    if value >= 1024:
+        return f"{value / 1024:.1f} KB/s"
+    return f"{int(value)} B/s"
+
+
 def fetch_wan_stats(force: bool = False) -> dict:
     global _wan_cache
     now = time.time()
@@ -696,6 +710,46 @@ def fetch_wan_stats(force: bool = False) -> dict:
         out["cached"] = True
         out["cache_age_sec"] = int(now - _wan_cache["ts"])
         return out
+    try:
+        token = zabbix_token()
+        hosts = zabbix_rpc(
+            "host.get",
+            {"output": ["hostid", "host", "name"], "filter": {"host": "ruijie-eg105gw"}},
+            token,
+        )
+        if hosts:
+            keys = ["ruijie.wan.rx.kbps", "ruijie.wan.tx.kbps", "ruijie.wan.link", "ruijie.wan.speed"]
+            items = zabbix_rpc(
+                "item.get",
+                {
+                    "output": ["key_", "lastvalue", "lastclock"],
+                    "hostids": hosts[0]["hostid"],
+                    "filter": {"key_": keys},
+                },
+                token,
+            )
+            by_key = {item["key_"]: item for item in items}
+            rx = float(by_key["ruijie.wan.rx.kbps"]["lastvalue"])
+            tx = float(by_key["ruijie.wan.tx.kbps"]["lastvalue"])
+            lastclock = max(int(item.get("lastclock") or 0) for item in by_key.values())
+            data = {
+                "ok": True,
+                "host": "192.168.24.1",
+                "name": "Ruijie EG105GW",
+                "download_bps": round(rx * 1000 / 8),
+                "upload_bps": round(tx * 1000 / 8),
+                "download_human": fmt_bps(round(rx * 1000 / 8)),
+                "upload_human": fmt_bps(round(tx * 1000 / 8)),
+                "link": by_key.get("ruijie.wan.link", {}).get("lastvalue"),
+                "speed_mbps": by_key.get("ruijie.wan.speed", {}).get("lastvalue"),
+                "api_method": "Zabbix ruijie.wan.* trapper items",
+                "timestamp": datetime.utcfromtimestamp(lastclock).isoformat() + "Z" if lastclock else datetime.utcnow().isoformat() + "Z",
+            }
+            _wan_cache = {"ts": now, "data": data}
+            data["cached"] = False
+            return data
+    except Exception:
+        pass
     try:
         proc = subprocess.run(
             ["node", RUIJIE_WAN_SCRIPT],
